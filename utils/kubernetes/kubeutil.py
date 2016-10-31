@@ -22,14 +22,11 @@ log = logging.getLogger('collector')
 KUBERNETES_CHECK_NAME = 'kubernetes'
 
 
-def is_k8s():
-    return 'KUBERNETES_PORT' in os.environ
-
-
 class KubeUtil:
     __metaclass__ = Singleton
 
     DEFAULT_METHOD = 'http'
+    MACHINE_INFO_PATH = '/api/v1.3/machine/'
     METRICS_PATH = '/api/v1.3/subcontainers/'
     PODS_LIST_PATH = '/pods/'
     DEFAULT_CADVISOR_PORT = 4194
@@ -68,9 +65,10 @@ class KubeUtil:
 
         self.kubelet_api_url = '%s://%s:%d' % (self.method, self.host, self.kubelet_port)
         self.cadvisor_url = '%s://%s:%d' % (self.method, self.host, self.cadvisor_port)
-        self.kubernetes_api_url = 'https://%s/api/v1' % self.DEFAULT_MASTER_NAME
+        self.kubernetes_api_url = 'https://%s/api/v1' % (os.environ.get('KUBERNETES_SERVICE_HOST') or self.DEFAULT_MASTER_NAME)
 
         self.metrics_url = urljoin(self.cadvisor_url, KubeUtil.METRICS_PATH)
+        self.machine_info_url = urljoin(self.cadvisor_url, KubeUtil.MACHINE_INFO_PATH)
         self.pods_list_url = urljoin(self.kubelet_api_url, KubeUtil.PODS_LIST_PATH)
         self.kube_health_url = urljoin(self.kubelet_api_url, 'healthz')
 
@@ -129,6 +127,12 @@ class KubeUtil:
         """
         return retrieve_json(self.pods_list_url)
 
+    def retrieve_machine_info(self):
+        """
+        Retrieve machine info from Cadvisor.
+        """
+        return retrieve_json(self.machine_info_url)
+
     def retrieve_metrics(self):
         """
         Retrieve metrics from Cadvisor.
@@ -183,7 +187,12 @@ class KubeUtil:
 
         The host IP address is different from the default router for the pod.
         """
-        pod_items = self.retrieve_pods_list().get("items") or []
+        try:
+            pod_items = self.retrieve_pods_list().get("items") or []
+        except Exception as e:
+            log.warning("Unable to retrieve pod list %s. Not fetching host data", str(e))
+            return
+
         for pod in pod_items:
             metadata = pod.get("metadata", {})
             name = metadata.get("name")
@@ -194,6 +203,23 @@ class KubeUtil:
                 self._node_ip = status.get('hostIP', '')
                 self._node_name = spec.get('nodeName', '')
                 break
+
+    def extract_event_tags(self, event):
+        """
+        Return a list of tags extracted from an event object
+        """
+        tags = []
+
+        if 'reason' in event:
+            tags.append('reason:%s' % event.get('reason', '').lower())
+        if 'namespace' in event.get('metadata', {}):
+            tags.append('namespace:%s' % event['metadata']['namespace'])
+        if 'host' in event.get('source', {}):
+            tags.append('node_name:%s' % event['source']['host'])
+        if 'kind' in event.get('involvedObject', {}):
+            tags.append('object_type:%s' % event['involvedObject'].get('kind', '').lower())
+
+        return tags
 
     @classmethod
     def get_auth_token(cls):

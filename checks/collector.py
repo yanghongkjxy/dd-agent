@@ -4,6 +4,7 @@
 
 # stdlib
 import collections
+import locale
 import logging
 import pprint
 import socket
@@ -29,15 +30,13 @@ import checks.system.unix as u
 import checks.system.win32 as w32
 import modules
 from util import (
-    EC2,
-    GCE,
-    get_os,
     get_uuid,
     Timer,
 )
+from utils.cloud_metadata import GCE, EC2
 from utils.logger import log_exceptions
 from utils.jmx import JMXFiles
-from utils.platform import Platform
+from utils.platform import Platform, get_os
 from utils.subprocess_output import get_subprocess_output
 
 log = logging.getLogger(__name__)
@@ -443,7 +442,8 @@ class Collector(object):
             current_check_service_checks = check.get_service_checks()
             if current_check_service_checks:
                 service_checks.extend(current_check_service_checks)
-            service_check_count = len(current_check_service_checks)
+            # -1 because the user doesn't care about the service check for check failure
+            service_check_count = len(current_check_service_checks) - 1
 
             # Update the check status with the correct service_check_count
             check_status.service_check_count = service_check_count
@@ -737,7 +737,7 @@ class Collector(object):
             pass
 
         metadata["hostname"] = self.hostname
-        metadata["timezones"] = sanitize_tzname(time.tzname)
+        metadata["timezones"] = self._decode_tzname(time.tzname)
 
         # Add cloud provider aliases
         host_aliases = GCE.get_host_aliases(self.agentConfig)
@@ -784,12 +784,16 @@ class Collector(object):
 
         return output
 
+    @staticmethod
+    def _decode_tzname(tzname):
+        """ On Windows, decodes the timezone from the system-preferred encoding
+        """
+        if Platform.is_windows():
+            try:
+                decoded_tzname = map(lambda tz: tz.decode(locale.getpreferredencoding()), tzname)
+            except Exception:
+                log.exception("Failed decoding timezone with encoding %s", locale.getpreferredencoding())
+                return ('', '')
+            return tuple(decoded_tzname)
 
-def sanitize_tzname(tzname):
-    """ Returns the tzname given, and deals with Japanese encoding issue
-    """
-    if tzname[0] == '\x93\x8c\x8b\x9e (\x95W\x8f\x80\x8e\x9e)':
-        log.debug('tzname from TOKYO detected and converted')
-        return ('JST', 'JST')
-    else:
         return tzname

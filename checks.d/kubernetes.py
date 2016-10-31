@@ -11,6 +11,7 @@ from fnmatch import fnmatch
 import numbers
 import re
 import time
+import calendar
 
 # 3rd party
 import requests
@@ -19,7 +20,8 @@ import simplejson as json
 # project
 from checks import AgentCheck
 from config import _is_affirmative
-from utils.kubeutil import KubeUtil
+from utils.kubernetes import KubeUtil
+
 
 NAMESPACE = "kubernetes"
 DEFAULT_MAX_DEPTH = 10
@@ -49,6 +51,28 @@ FUNC_MAP = {
 
 EVENT_TYPE = 'kubernetes'
 
+# Suffixes per
+# https://github.com/kubernetes/kubernetes/blob/8fd414537b5143ab039cb910590237cabf4af783/pkg/api/resource/suffix.go#L108
+FACTORS = {
+    'n': float(1)/(1000*1000*1000),
+    'u': float(1)/(1000*1000),
+    'm': float(1)/1000,
+    'k': 1000,
+    'M': 1000*1000,
+    'G': 1000*1000*1000,
+    'T': 1000*1000*1000*1000,
+    'P': 1000*1000*1000*1000*1000,
+    'E': 1000*1000*1000*1000*1000*1000,
+    'Ki': 1024,
+    'Mi': 1024*1024,
+    'Gi': 1024*1024*1024,
+    'Ti': 1024*1024*1024*1024,
+    'Pi': 1024*1024*1024*1024*1024,
+    'Ei': 1024*1024*1024*1024*1024*1024,
+}
+
+QUANTITY_EXP = re.compile(r'[-+]?\d+[\.]?\d*[numkMGTPE]?i?')
+
 
 class Kubernetes(AgentCheck):
     """ Collect metrics and events from kubelet """
@@ -70,7 +94,7 @@ class Kubernetes(AgentCheck):
         service_check_base = NAMESPACE + '.kubelet.check'
         is_ok = True
         try:
-            r = requests.get(url)
+            r = requests.get(url, params={'verbose': True})
             for line in r.iter_lines():
 
                 # avoid noise; this check is expected to fail since we override the container hostname
@@ -101,7 +125,6 @@ class Kubernetes(AgentCheck):
                 self.service_check(service_check_base, AgentCheck.CRITICAL)
 
     def check(self, instance):
-
         self.max_depth = instance.get('max_depth', DEFAULT_MAX_DEPTH)
         enabled_gauges = instance.get('enabled_gauges', DEFAULT_ENABLED_GAUGES)
         self.enabled_gauges = ["{0}.{1}".format(NAMESPACE, x) for x in enabled_gauges]
@@ -248,6 +271,16 @@ class Kubernetes(AgentCheck):
         return tags
 
     def _update_metrics(self, instance, pods_list):
+        def parse_quantity(s):
+            number = ''
+            unit = ''
+            for c in s:
+                if c.isdigit() or c == '.':
+                    number += c
+                else:
+                    unit += c
+            return float(number) * FACTORS.get(unit, 1)
+
         metrics = self.kubeutil.retrieve_metrics()
 
         excluded_labels = instance.get('excluded_labels')
@@ -288,12 +321,10 @@ class Kubernetes(AgentCheck):
                 c_name = container.get('name')
                 _tags = container_tags.get(name2id.get(c_name), [])
 
-                prog = re.compile(r'[-+]?\d+[\.]?\d*')
-
                 # limits
                 try:
                     for limit, value_str in container['resources']['limits'].iteritems():
-                        values = [float(s) for s in prog.findall(value_str)]
+                        values = [parse_quantity(s) for s in QUANTITY_EXP.findall(value_str)]
                         if len(values) != 1:
                             self.log.warning("Error parsing limits value string: %s", value_str)
                             continue
@@ -305,7 +336,7 @@ class Kubernetes(AgentCheck):
                 # requests
                 try:
                     for request, value_str in container['resources']['requests'].iteritems():
-                        values = [float(s) for s in prog.findall(value_str)]
+                        values = [parse_quantity(s) for s in QUANTITY_EXP.findall(value_str)]
                         if len(values) != 1:
                             self.log.warning("Error parsing requests value string: %s", value_str)
                             continue
@@ -315,6 +346,18 @@ class Kubernetes(AgentCheck):
                     self.log.debug("Container object for {}: {}".format(c_name, container))
 
         self._update_pods_metrics(instance, pods_list)
+        self._update_node(instance)
+
+    def _update_node(self, instance):
+        machine_info = self.kubeutil.retrieve_machine_info()
+        num_cores = machine_info.get('num_cores', 0)
+        memory_capacity = machine_info.get('memory_capacity', 0)
+
+        tags = instance.get('tags', [])
+        self.publish_gauge(self, NAMESPACE + '.cpu.capacity', float(num_cores), tags)
+        self.publish_gauge(self, NAMESPACE + '.memory.capacity', float(memory_capacity), tags)
+        # TODO(markine): Report 'allocatable' which is capacity minus capacity
+        # reserved for system/Kubernetes.
 
     def _update_pods_metrics(self, instance, pods):
         supported_kinds = [
@@ -371,11 +414,13 @@ class Kubernetes(AgentCheck):
 
         for event in event_items:
             # skip if the event is too old
-            event_ts = int(time.mktime(time.strptime(event.get('lastTimestamp'), '%Y-%m-%dT%H:%M:%SZ')))
+            event_ts = calendar.timegm(time.strptime(event.get('lastTimestamp'), '%Y-%m-%dT%H:%M:%SZ'))
             if event_ts <= last_read:
                 continue
 
             involved_obj = event.get('involvedObject', {})
+
+            tags = self.kubeutil.extract_event_tags(event)
 
             # compute the most recently seen event, without relying on items order
             if event_ts > most_recent_read:
@@ -395,6 +440,7 @@ class Kubernetes(AgentCheck):
                 'msg_text': msg_body,
                 'source_type_name': EVENT_TYPE,
                 'event_object': 'kubernetes:{}'.format(involved_obj.get('name')),
+                'tags': tags,
             }
             self.event(dd_event)
 

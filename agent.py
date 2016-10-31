@@ -36,13 +36,13 @@ from config import (
 )
 from daemon import AgentSupervisor, Daemon
 from emitter import http_emitter
-from util import (
-    EC2,
-    get_hostname,
-    Watchdog,
-)
-from utils.flare import Flare
+
+# utils
+from util import Watchdog
+from utils.cloud_metadata import EC2
 from utils.configcheck import configcheck, sd_configcheck
+from utils.flare import Flare
+from utils.hostname import get_hostname
 from utils.jmx import jmx_command
 from utils.pidfile import PidFile
 from utils.profile import AgentProfiler
@@ -225,8 +225,13 @@ class Agent(Daemon):
         self.collector = Collector(self._agentConfig, emitters, systemStats, hostname)
 
         # In developer mode, the number of runs to be included in a single collector profile
-        self.collector_profile_interval = self._agentConfig.get('collector_profile_interval',
-                                                                DEFAULT_COLLECTOR_PROFILE_INTERVAL)
+        try:
+            self.collector_profile_interval = int(
+                self._agentConfig.get('collector_profile_interval', DEFAULT_COLLECTOR_PROFILE_INTERVAL))
+        except ValueError:
+            log.warn('collector_profile_interval is invalid. '
+                     'Using default value instead (%s).' % DEFAULT_COLLECTOR_PROFILE_INTERVAL)
+            self.collector_profile_interval = DEFAULT_COLLECTOR_PROFILE_INTERVAL
 
         # Configure the watchdog.
         self.check_frequency = int(self._agentConfig['check_freq'])

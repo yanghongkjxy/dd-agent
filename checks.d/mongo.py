@@ -1,6 +1,7 @@
 # stdlib
 import re
 import time
+import urllib
 
 # 3p
 import pymongo
@@ -71,6 +72,7 @@ class MongoDb(AgentCheck):
         "cursors.totalOpen": GAUGE,
         "extra_info.heap_usage_bytes": RATE,
         "extra_info.page_faults": RATE,
+        "fsyncLocked": GAUGE,
         "globalLock.activeClients.readers": GAUGE,
         "globalLock.activeClients.total": GAUGE,
         "globalLock.activeClients.writers": GAUGE,
@@ -155,6 +157,8 @@ class MongoDb(AgentCheck):
         "replSet.health": GAUGE,
         "replSet.replicationLag": GAUGE,
         "replSet.state": GAUGE,
+        "replSet.votes": GAUGE,
+        "replSet.voteFraction": GAUGE,
         "stats.avgObjSize": GAUGE,
         "stats.collections": GAUGE,
         "stats.dataSize": GAUGE,
@@ -440,7 +444,10 @@ class MongoDb(AgentCheck):
     def hostname_for_event(self, clean_server_name, agentConfig):
         """Return a reasonable hostname for a replset membership event to mention."""
         uri = urlsplit(clean_server_name)
-        hostname = uri.netloc.split(':')[0]
+        if '@' in uri.netloc:
+            hostname = uri.netloc.split('@')[1].split(':')[0]
+        else:
+            hostname = uri.netloc.split(':')[0]
         if hostname == 'localhost':
             hostname = self.hostname
         return hostname
@@ -549,6 +556,38 @@ class MongoDb(AgentCheck):
             metric_prefix=metric_prefix, metric_suffix=metric_suffix
         )
 
+    def _authenticate(self, database, username, password, use_x509):
+        """
+        Authenticate to the database.
+
+        Available mechanisms:
+        * Username & password
+        * X.509
+
+        More information:
+        https://api.mongodb.com/python/current/examples/authentication.html
+        """
+        authenticated = False
+        try:
+            # X.509
+            if use_x509:
+                self.log.debug(
+                    u"Authenticate `%s`  to `%s` using `MONGODB-X509` mechanism",
+                    username, database
+                )
+                authenticated = database.authenticate(username, mechanism='MONGODB-X509')
+
+            # Username & password
+            else:
+                authenticated = database.authenticate(username, password)
+
+        except pymongo.errors.PyMongoError as e:
+            self.log.error(
+                u"Authentication failed due to invalid credentials or configuration issues. %s", e
+            )
+
+        return authenticated
+
     def check(self, instance):
         """
         Returns a dictionary that looks a lot like what's sent back by
@@ -571,8 +610,7 @@ class MongoDb(AgentCheck):
         if 'server' not in instance:
             raise Exception("Missing 'server' in mongo config")
 
-        server = instance['server']
-
+        # x.509 authentication
         ssl_params = {
             'ssl': instance.get('ssl', None),
             'ssl_keyfile': instance.get('ssl_keyfile', None),
@@ -586,34 +624,50 @@ class MongoDb(AgentCheck):
                 del ssl_params[key]
 
         # Configuration a URL, mongodb://user:pass@server/db
+        server = instance['server']
         parsed = pymongo.uri_parser.parse_uri(server)
         username = parsed.get('username')
         password = parsed.get('password')
         db_name = parsed.get('database')
-        clean_server_name = server.replace(password, "*" * 5) if password is not None else server
-
-        if not db_name:
-            self.log.debug('No MongoDB database found in URI. Defaulting to admin.')
-            db_name = 'admin'
-
-        tags = instance.get('tags', [])
-        # de-dupe tags to avoid a memory leak
-        tags = list(set(tags))
-        service_check_tags = [
-            "db:%s" % db_name
-        ]
-        service_check_tags.extend(tags)
-        # Add the `server` tag to the metrics' tags only (it's added in the backend for service checks)
-        tags.append('server:%s' % clean_server_name)
-
-        # Get the list of metrics to collect
         additional_metrics = instance.get('additional_metrics', [])
 
+        # IF the password contains a URL encoded character (for example '/'), then the
+        # raw server string will have %2F, but the password string will have the '/'.
+        # Therefore, the string replace (below) won't work, because it won't have an
+        # exact match.  Convert the password *back* to URL encoded, so the string
+        # replace works properly.
+        encoded_password = urllib.quote_plus(password) if password else None
+
+        clean_server_name = server.replace(encoded_password, "*" * 5) if encoded_password else server
+
+        if ssl_params:
+            username_uri = u"{}@".format(urllib.quote(username))
+            clean_server_name = clean_server_name.replace(username_uri, "")
+
+        # Get the list of metrics to collect
         collect_tcmalloc_metrics = 'tcmalloc' in additional_metrics
         metrics_to_collect = self._get_metrics_to_collect(
             server,
             additional_metrics
         )
+
+        # Tagging
+        tags = instance.get('tags', [])
+        # ...de-dupe tags to avoid a memory leak
+        tags = list(set(tags))
+
+        if not db_name:
+            self.log.info('No MongoDB database found in URI. Defaulting to admin.')
+            db_name = 'admin'
+
+        service_check_tags = [
+            "db:%s" % db_name
+        ]
+        service_check_tags.extend(tags)
+
+        # ...add the `server` tag to the metrics' tags only
+        # (it's added in the backend for service checks)
+        tags.append('server:%s' % clean_server_name)
 
         nodelist = parsed.get('nodelist')
         if nodelist:
@@ -623,11 +677,6 @@ class MongoDb(AgentCheck):
                 "host:%s" % host,
                 "port:%s" % port
             ]
-
-        do_auth = True
-        if username is None or password is None:
-            self.log.debug("Mongo: cannot extract username and password from config %s" % server)
-            do_auth = False
 
         timeout = float(instance.get('timeout', DEFAULT_TIMEOUT)) * 1000
         try:
@@ -646,8 +695,18 @@ class MongoDb(AgentCheck):
                 tags=service_check_tags)
             raise
 
-        if do_auth and not db.authenticate(username, password):
-            message = "Mongo: cannot connect with config %s" % server
+        # Authenticate
+        do_auth = True
+        use_x509 = ssl_params and not password
+
+        if not username:
+            self.log.debug(
+                u"A username is required to authenticate to `%s`", server
+            )
+            do_auth = False
+
+        if do_auth and not self._authenticate(db, username, password, use_x509):
+            message = u"Mongo: cannot connect with config `%s`" % clean_server_name
             self.service_check(
                 self.SERVICE_CHECK_NAME,
                 AgentCheck.CRITICAL,
@@ -671,6 +730,9 @@ class MongoDb(AgentCheck):
 
         if status['ok'] == 0:
             raise Exception(status['errmsg'].__str__())
+
+        ops = db['$cmd.sys.inprog'].find_one()
+        status['fsyncLocked'] = 1 if ops.get('fsyncLock') else 0
 
         status['stats'] = db.command('dbstats')
         dbstats = {}
@@ -698,7 +760,7 @@ class MongoDb(AgentCheck):
                     **ssl_params)
                 db = cli[db_name]
 
-                if do_auth and not db.authenticate(username, password):
+                if do_auth and not self._authenticate(db, username, password, use_x509):
                     message = ("Mongo: cannot connect with config %s" % server)
                     self.service_check(
                         self.SERVICE_CHECK_NAME,
@@ -733,6 +795,16 @@ class MongoDb(AgentCheck):
                     data['health'] = current['health']
 
                 data['state'] = replSet['myState']
+
+                if current is not None:
+                    total = 0.0
+                    cfg = cli['local']['system.replset'].find_one()
+                    for member in cfg.get('members'):
+                        total += member.get('votes', 1)
+                        if member['_id'] == current['_id']:
+                            data['votes'] = member.get('votes', 1)
+                    data['voteFraction'] = data['votes'] / total
+
                 status['replSet'] = data
 
                 # Submit events
