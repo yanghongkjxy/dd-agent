@@ -40,10 +40,6 @@ from config import (
 from daemon import AgentSupervisor, Daemon
 from emitter import http_emitter
 from utils.platform import Platform
-import rpc.service_discovery_pb2
-
-#3p
-import grpc
 
 # utils
 from util import Watchdog
@@ -96,17 +92,16 @@ class Agent(Daemon):
         # this flag can be set to True, False, or a list of checks (for partial reload)
         self.reload_configs_flag = False
         self.sd_backend = None
-        self.supervisor_proxy = xmlrpclib.ServerProxy(
-            'http://127.0.0.1',
-            transport=supervisor.xmlrpc.SupervisorTransport(
-                None, None, serverurl='unix:///opt/datadog-agent/run/datadog-supervisor.sock')
-        )
-        channel = grpc.insecure_channel('localhost:50051')
-        self.rpcstub = rpc.service_discovery_pb2.ServiceDiscoveryStub(channel)
 
         if Platform.is_windows():
+            self.supervisor_proxy = xmlrpclib.ServerProxy(
+                'http://127.0.0.1',
+                transport=supervisor.xmlrpc.SupervisorTransport(
+                    None, None, serverurl='unix:///opt/datadog-agent/run/datadog-supervisor.sock')
+            )
             pipe_name = SD_PIPE_WIN_PATH.format(pipename=SD_PIPE_NAME)
         else:
+            self.supervisor_proxy = None
             pipe_name = os.path.join("/tmp", "dd-service_discovery")
 
         if not os.path.exists(pipe_name):
@@ -162,19 +157,18 @@ class Agent(Daemon):
         # restart jmx
         if jmx_sd_configs:
             # TODO jaime: set guards here this is unix specific.
-            jmx_state = self.supervisor_proxy.supervisor.getProcessInfo(JMX_SUPERVISOR_ENTRY)
-            log.debug("Current JMX check state: %s", jmx_state['statename'])
-            if jmx_state['statename'] in ['STOPPED', 'EXITED', 'FATAL'] and self._agentConfig.get('sd_jmx_enable'):
-                log.debug("Starting JMX...")
-                self.supervisor_proxy.supervisor.startProcess(JMX_SUPERVISOR_ENTRY)
-                time.sleep(JMX_GRACE_SECS)
-                # TODO jaime: we probably have to wait for the the process to come up...
+            if self.supervisor_proxy:
+                jmx_state = self.supervisor_proxy.supervisor.getProcessInfo(JMX_SUPERVISOR_ENTRY)
+                log.debug("Current JMX check state: %s", jmx_state['statename'])
+                if jmx_state['statename'] in ['STOPPED', 'EXITED', 'FATAL'] and self._agentConfig.get('sd_jmx_enable'):
+                    self.supervisor_proxy.supervisor.startProcess(JMX_SUPERVISOR_ENTRY)
+                    time.sleep(JMX_GRACE_SECS)
+            else:
+                log.debug("Unable to automatically start jmxfetch on Windows via supervisor.")
 
             buffer = ""
             for name, yaml in jmx_sd_configs.iteritems():
                 try:
-                    # res = self.rpcstub.SetConfig(rpc.service_discovery_pb2.SDConfig(name="{}{}".format(
-                    #     SERVICE_DISCOVERY_PREFIX, name), config=yaml))
                     buffer += SD_CONFIG_SEP
                     buffer += "# {}\n".format(name)
                     buffer += yaml
@@ -182,11 +176,6 @@ class Agent(Daemon):
                     log.exception("unable to submit YAML via RPC: %s", e)
                 else:
                     log.info("JMX SD Config via named pip %s successfully.", name)
-                    # if res.success:
-                    #     log.info("JMX SD Config submitted via RPC for %s successfully.", name)
-                    # else:
-                    #     log.info("JMX SD Config submitted via RPC for %s failed. \
-                    #              Perhaps overriden by file config or bad YAML.", name)
 
             if buffer:
                 os.write(self.sd_pipe, buffer)
