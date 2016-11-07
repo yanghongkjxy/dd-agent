@@ -549,9 +549,6 @@ def main(config_path=None):
     deprecate_old_command_line_tools()
 
     COMMANDS_START_DOGSTATSD = [
-        'start',
-        'stop',
-        'restart',
         'status'
     ]
 
@@ -570,20 +567,18 @@ def main(config_path=None):
         daemon.start(foreground=True)
         return 0
 
-    # Otherwise, we're process the deamon command.
+    # Otherwise, let's display the info/status/an error.
     else:
         command = args[0]
 
-        if command == 'start':
-            daemon.start()
-        elif command == 'stop':
-            daemon.stop()
-        elif command == 'restart':
-            daemon.restart()
-        elif command == 'status':
+        if command == 'status':
             daemon.status()
         elif command == 'info':
             return Dogstatsd.info()
+        elif command in ['start', 'stop', 'restart']:
+            sys.stderr.write('Please use supervisor to manage dogstatsd')
+            parser.print_help()
+            return 1
         else:
             sys.stderr.write("Unknown command: %s\n\n" % command)
             parser.print_help()

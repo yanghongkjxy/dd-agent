@@ -363,9 +363,6 @@ def main():
     hostname = get_hostname(agentConfig)
     in_developer_mode = agentConfig.get('developer_mode')
     COMMANDS_AGENT = [
-        'start',
-        'stop',
-        'restart',
         'status',
         'foreground',
     ]
@@ -401,17 +398,9 @@ def main():
     if command in START_COMMANDS:
         log.info('Agent version %s' % get_version())
 
-    if 'start' == command:
-        log.info('Start daemon')
-        agent.start()
-
-    elif 'stop' == command:
-        log.info('Stop daemon')
-        agent.stop()
-
-    elif 'restart' == command:
-        log.info('Restart daemon')
-        agent.restart()
+    if command in ['start', 'stop', 'restart']:
+        logging.error('Please use supervisor to manage the agent')
+        return 1
 
     elif 'status' == command:
         agent.status()
@@ -420,20 +409,8 @@ def main():
         return Agent.info(verbose=options.verbose)
 
     elif 'foreground' == command:
-        if autorestart:
-            # Set-up the supervisor callbacks and fork it.
-            logging.info('Running Agent with auto-restart ON')
-
-            def child_func():
-                agent.start(foreground=True)
-
-            def parent_func():
-                agent.start_event = False
-
-            AgentSupervisor.start(parent_func, child_func)
-        else:
-            # Run in the standard foreground.
-            agent.start(foreground=True)
+        # Run in the standard foreground.
+        agent.start(foreground=True)
 
     elif 'check' == command:
         if len(args) < 2:
