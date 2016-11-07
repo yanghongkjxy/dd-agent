@@ -65,9 +65,11 @@ JMX_SUPERVISOR_ENTRY = 'datadog-agent:jmxfetch'
 JMX_GRACE_SECS = 2
 SERVICE_DISCOVERY_PREFIX = 'SD-'
 SD_PIPE_NAME = "dd-service_discovery"
+SD_PIPE_UNIX_PATH = "/tmp"
 SD_PIPE_WIN_PATH = "\\\\.\\pipe\\{pipename}"
 SD_CONFIG_SEP = "#### SERVICE-DISCOVERY ####\n"
 
+DEFAULT_SUPERVISOR_SOCKET = '/opt/datadog-agent/run/datadog-supervisor.sock'
 DEFAULT_COLLECTOR_PROFILE_INTERVAL = 20
 
 # Globals
@@ -92,22 +94,16 @@ class Agent(Daemon):
         # this flag can be set to True, False, or a list of checks (for partial reload)
         self.reload_configs_flag = False
         self.sd_backend = None
+        self.supervisor_proxy = None
 
         if Platform.is_windows():
-            self.supervisor_proxy = xmlrpclib.ServerProxy(
-                'http://127.0.0.1',
-                transport=supervisor.xmlrpc.SupervisorTransport(
-                    None, None, serverurl='unix:///opt/datadog-agent/run/datadog-supervisor.sock')
-            )
             pipe_name = SD_PIPE_WIN_PATH.format(pipename=SD_PIPE_NAME)
         else:
-            self.supervisor_proxy = None
-            pipe_name = os.path.join("/tmp", "dd-service_discovery")
+            pipe_name = os.path.join(SD_PIPE_UNIX_PATH, SD_PIPE_NAME)
 
         if not os.path.exists(pipe_name):
             os.mkfifo(pipe_name)
-        # self.sd_pipe = os.open(pipe_name, os.O_WRONLY)
-        self.sd_pipe = os.open(pipe_name, os.O_RDWR) # to avoid blocking
+        self.sd_pipe = os.open(pipe_name, os.O_RDWR) # RW to avoid blocking (will only W)
 
     def _handle_sigterm(self, signum, frame):
         """Handles SIGTERM and SIGINT, which gracefully stops the agent."""
@@ -156,7 +152,6 @@ class Agent(Daemon):
 
         # restart jmx
         if jmx_sd_configs:
-            # TODO jaime: set guards here this is unix specific.
             if self.supervisor_proxy:
                 jmx_state = self.supervisor_proxy.supervisor.getProcessInfo(JMX_SUPERVISOR_ENTRY)
                 log.debug("Current JMX check state: %s", jmx_state['statename'])
@@ -275,6 +270,9 @@ class Agent(Daemon):
         # Initialize service discovery
         if self._agentConfig.get('service_discovery'):
             self.sd_backend = get_sd_backend(self._agentConfig)
+
+        # Initialize Supervisor proxy (unix specific)
+        self.supervisor_proxy = self._get_supervisor_socket(self._agentConfig)
 
         # Load the checks.d checks
         self._checksd = load_check_directory(self._agentConfig, hostname)
@@ -396,6 +394,19 @@ class Agent(Daemon):
             else:
                 log.info('Not running on EC2, using hostname to identify this server')
         return agentConfig
+
+    def _get_supervisor_socket(self, agentConfig):
+        if Platform.is_windows():
+            return None
+
+        sockfile = agentConfig.get('supervisor_socket', DEFAULT_SUPERVISOR_SOCKET)
+        supervisor_proxy = xmlrpclib.ServerProxy(
+            'http://127.0.0.1',
+            transport=supervisor.xmlrpc.SupervisorTransport(
+                None, None, serverurl="unix://{socket}".format(socket=sockfile))
+        )
+
+        return supervisor_proxy
 
     def _should_restart(self):
         if time.time() - self.agent_start > self.restart_interval:
