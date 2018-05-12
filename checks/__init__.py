@@ -29,13 +29,13 @@ import yaml
 
 # project
 from checks import check_status
+from config import AGENT_VERSION, _is_affirmative
 from util import get_next_id, yLoader
 from utils.hostname import get_hostname
 from utils.proxy import get_proxy
-from utils.platform import Platform
 from utils.profile import pretty_statistics
-if Platform.is_windows():
-    from utils.debug import run_check  # noqa - windows debug purpose
+from utils.proxy import get_no_proxy_from_env, config_proxy_skip
+
 
 log = logging.getLogger(__name__)
 
@@ -94,7 +94,7 @@ class Check(object):
         """Turn a metric into a well-formed metric name
         prefix.b.c
         """
-        name = re.sub(r"[,\+\*\-/()\[\]{}\s]", "_", metric)
+        name = re.sub(r"[,\@\+\*\-/()\[\]{}\s]", "_", metric)
         # Eliminate multiple _
         name = re.sub(r"__+", "_", name)
         # Don't start/end with _
@@ -324,8 +324,11 @@ class AgentCheck(object):
         self.name = name
         self.init_config = init_config or {}
         self.agentConfig = agentConfig
+
         self.in_developer_mode = agentConfig.get('developer_mode') and psutil
         self._internal_profiling_stats = None
+        self.allow_profiling = self.agentConfig.get('allow_profiling', True)
+
         self.default_integration_http_timeout = float(agentConfig.get('default_integration_http_timeout', 9))
 
         self.hostname = agentConfig.get('checksd_hostname') or get_hostname(agentConfig)
@@ -343,19 +346,17 @@ class AgentCheck(object):
             histogram_percentiles=agentConfig.get('histogram_percentiles')
         )
 
-        if Platform.is_linux() and psutil is not None:
-            procfs_path = self.agentConfig.get('procfs_path', '/proc').rstrip('/')
-            psutil.PROCFS_PATH = procfs_path
-
         self.events = []
         self.service_checks = []
         self.instances = instances or []
         self.warnings = []
+        self.check_version = None
         self.library_versions = None
         self.last_collection_time = defaultdict(int)
         self._instance_metadata = []
         self.svc_metadata = []
         self.historate_dict = {}
+        self.manifest_path = None
 
         # Set proxy settings
         self.proxy_settings = get_proxy(self.agentConfig)
@@ -375,6 +376,36 @@ class AgentCheck(object):
                     uri=uri)
             self.proxies['http'] = "http://{uri}".format(uri=uri)
             self.proxies['https'] = "https://{uri}".format(uri=uri)
+
+    def set_manifest_path(self, manifest_path):
+        self.manifest_path = manifest_path
+
+    def set_check_version(self, version=None, manifest=None):
+        _version = version or AGENT_VERSION
+
+        if manifest is not None:
+            _version = "{core}:{sdk}".format(core=AGENT_VERSION,
+                                        sdk=manifest.get('version', 'unknown'))
+
+        self.check_version = _version
+
+    def get_instance_proxy(self, instance, uri, proxies=None):
+        proxies = proxies if proxies is not None else self.proxies.copy()
+        proxies['no'] = get_no_proxy_from_env()
+
+        deprecated_skip = instance.get('no_proxy', None)
+        skip = (
+            _is_affirmative(instance.get('skip_proxy', False)) or
+            _is_affirmative(deprecated_skip)
+        )
+
+        if deprecated_skip is not None:
+            self.warning(
+                'Deprecation notice: The `no_proxy` config option has been renamed '
+                'to `skip_proxy` and will be removed in a future release.'
+            )
+
+        return config_proxy_skip(proxies, uri, skip)
 
     def instance_count(self):
         """ Return the number of instances that are configured for this check. """
@@ -542,6 +573,8 @@ class AgentCheck(object):
         :param hostname: (optional) A hostname for this metric. Defaults to the current hostname.
         :param device_name: (optional) The device name for this metric
         """
+        self.warning("Deprecation notice: the `set` method of `AgentCheck` is deprecated and will be removed " +
+            "in the next major version of the Agent, please compute aggregates in your check and use `gauge` instead")
         self.aggregator.set(metric, value, tags, hostname, device_name)
 
     def event(self, event):
@@ -563,6 +596,9 @@ class AgentCheck(object):
                 "tags": (optional) list, a list of tags to associate with this event
             }
         """
+        tags = event.get("tags")
+        if tags:
+            event["tags"] = sorted(set(tags))
         self.events.append(event)
 
     def service_check(self, check_name, status, tags=None, timestamp=None,
@@ -585,6 +621,8 @@ class AgentCheck(object):
             hostname = self.hostname
         if message is not None:
             message = unicode(message) # ascii converts to unicode but not viceversa
+        if tags:
+            tags = sorted(set(tags))
         self.service_checks.append(
             create_service_check(check_name, status, tags, timestamp,
                                  hostname, check_run_id, message)
@@ -732,13 +770,16 @@ class AgentCheck(object):
         return stats
 
     def _set_internal_profiling_stats(self, before, after):
-        self._internal_profiling_stats = {'before': before, 'after': after}
+        if self.allow_profiling:
+            self._internal_profiling_stats = {'before': before, 'after': after}
 
     def _get_internal_profiling_stats(self):
         """
         If in developer mode, return a dictionary of statistics about the check run
         """
-        stats = self._internal_profiling_stats
+        stats = None
+        if self.allow_profiling:
+            stats = self._internal_profiling_stats
         self._internal_profiling_stats = None
         return stats
 
@@ -792,14 +833,17 @@ class AgentCheck(object):
                 )
             finally:
                 self._roll_up_instance_metadata()
+                # Discard any remaining warning so that next instance starts clean
+                self.get_warnings()
 
             instance_statuses.append(instance_status)
 
         if self.in_developer_mode and self.name != AGENT_METRICS_CHECK_NAME:
             try:
                 after = AgentCheck._collect_internal_stats()
-                self._set_internal_profiling_stats(before, after)
-                log.info("\n \t %s %s" % (self.name, pretty_statistics(self._internal_profiling_stats)))
+                if self.allow_profiling:
+                    self._set_internal_profiling_stats(before, after)
+                    log.info("\n \t %s %s" % (self.name, pretty_statistics(self._internal_profiling_stats)))
             except Exception:  # It's fine if we can't collect stats for the run, just log and proceed
                 self.log.debug("Failed to collect Agent Stats after check {0}".format(self.name))
 
@@ -843,6 +887,9 @@ class AgentCheck(object):
             check = cls(check_name, config.get('init_config') or {}, agentConfig or {})
         return check, config.get('instances', [])
 
+    def normalize_device_name(self, device_name):
+        return re.sub(r"[,\@\+\*\-\()\[\]{}\s]", "_", device_name)
+
     def normalize(self, metric, prefix=None, fix_case=False):
         """
         Turn a metric into a well-formed metric name
@@ -863,7 +910,7 @@ class AgentCheck(object):
             if prefix is not None:
                 prefix = self.convert_to_underscore_separated(prefix)
         else:
-            name = re.sub(r"[,\+\*\-/()\[\]{}\s]", "_", metric_name)
+            name = re.sub(r"[,\@\+\*\-/()\[\]{}\s]", "_", metric_name)
         # Eliminate multiple _
         name = re.sub(r"__+", "_", name)
         # Don't start/end with _
@@ -895,6 +942,8 @@ class AgentCheck(object):
 
     @staticmethod
     def read_config(instance, key, message=None, cast=None):
+        log.warning("Deprecation notice: the `read_config` method of `AgentCheck` is deprecated and will be removed " +
+            "in the next major version of the Agent")
         val = instance.get(key)
         if val is None:
             message = message or 'Must provide `%s` value in instance config' % key
@@ -913,7 +962,7 @@ def agent_formatter(metric, value, timestamp, tags, hostname, device_name=None,
     """
     attributes = {}
     if tags:
-        attributes['tags'] = list(tags)
+        attributes['tags'] = tags
     if hostname:
         attributes['hostname'] = hostname
     if device_name:
@@ -937,12 +986,17 @@ def create_service_check(check_name, status, tags=None, timestamp=None,
     """
     if check_run_id is None:
         check_run_id = get_next_id('service_check')
-    return {
+    service_check = {
         'id': check_run_id,
         'check': check_name,
         'status': status,
-        'host_name': hostname,
-        'tags': tags,
         'timestamp': float(timestamp or time.time()),
-        'message': message
     }
+    if hostname is not None:
+        service_check['host_name'] = hostname
+    if tags is not None:
+        service_check['tags'] = tags
+    if message is not None:
+        service_check["message"] = message
+
+    return service_check

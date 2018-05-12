@@ -42,16 +42,17 @@ def travis_pr?
   !ENV['TRAVIS'].nil? && ENV['TRAVIS_EVENT_TYPE'] == 'pull_request'
 end
 
+# Dict converting check.d name to Travis flavor names
 BAD_CITIZENS = {
   'couch' => 'couchdb',
   'disk' => 'system',
+  'dns_check' => 'system',
   'network' => 'system',
   'tcp_check' => 'system',
   'http_check' => 'system',
   'sysstat' => 'system',
   'elastic' => 'elasticsearch',
   'gearmand' => 'gearman',
-  'mongo' => 'mongodb',
   'mcache' => 'memcache',
   'php_fpm' => 'phpfpm',
   'redisdb' => 'redis',
@@ -61,7 +62,8 @@ BAD_CITIZENS = {
 
 def translate_to_travis(checks)
   checks.map do |check_name|
-    BAD_CITIZENS.key? check_name ? BAD_CITIZENS[check_name] : check_name
+    check_name = BAD_CITIZENS[check_name] if BAD_CITIZENS.key? check_name
+    check_name
   end
 end
 
@@ -76,10 +78,12 @@ def can_skip?
   puts "Git diff: \n#{git_output}"
   git_output.each_line do |filename|
     filename.strip!
+    puts filename
     if filename.start_with? 'checks.d'
       check_name = File.basename(filename, '.py')
     elsif filename.start_with?('tests/checks/integration', 'tests/checks/mock')
-      check_name = File.basename(filename, '.py').slice 'test_'
+      # 5 is test_
+      check_name = File.basename(filename, '.py').slice(5, 100)
     elsif filename.start_with?('tests/checks/fixtures', 'conf.d')
       next
     else
@@ -239,17 +243,21 @@ namespace :ci do
       flavor = attr[:flavor]
       # flavor.scope.path is ci:cassandra
       # flavor.scope.path[3..-1] is cassandra
-      check_name = flavor.scope.path[3..-1]
+      travis_flavor = flavor.scope.path[3..-1]
 
       can_skip, checks = can_skip?
-      can_skip &&= !%w(default core_integration checks_mock).include?(check_name)
-      if can_skip && !checks.include?(check_name)
-        puts "Skipping #{check_name} tests, not affected by the change".yellow
+      can_skip &&= !%w[default core_integration checks_mock].include?(travis_flavor)
+
+      puts "Travis flavor: #{travis_flavor}"
+      puts "Detected modified checks: #{checks.join(' | ')}"
+
+      if can_skip && !checks.include?(travis_flavor)
+        puts "Skipping #{travis_flavor} tests, not affected by the change".yellow
         next
       end
       exception = nil
       begin
-        tasks = %w(before_install install before_script script)
+        tasks = %w[before_install install before_script script]
         tasks << 'before_cache' unless ENV['CI'].nil?
         tasks.each do |t|
           Rake::Task["#{flavor.scope.path}:#{t}"].invoke

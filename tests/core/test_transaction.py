@@ -149,6 +149,7 @@ class TestTransaction(unittest.TestCase):
 
         app = Application()
         app.skip_ssl_validation = False
+        app.agent_dns_caching = False
         app._agentConfig = config
         app.use_simple_http_client = True
 
@@ -183,6 +184,7 @@ class TestTransaction(unittest.TestCase):
 
         app = Application()
         app.skip_ssl_validation = False
+        app.agent_dns_caching = False
         app._agentConfig = config
         app.use_simple_http_client = True
 
@@ -218,9 +220,13 @@ class TestTransaction(unittest.TestCase):
         self.assertEqual(endpoints, expected, (endpoints, expected))
 
         for url in endpoints:
-            r = requests.post(url, data=json.dumps({"foo": "bar"}),
-                              headers={'Content-Type': "application/json"})
-            r.raise_for_status()
+            try:
+                r = requests.post(url, data=json.dumps({"foo": "bar"}),
+                                headers={'Content-Type': "application/json"})
+                r.raise_for_status()
+            except requests.HTTPError:
+                if r.status_code != 400 or 'No series present in the payload' not in r.content:
+                    raise
 
         # API Service Check Transaction
         APIServiceCheckTransaction._trManager = trManager

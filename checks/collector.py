@@ -12,6 +12,11 @@ import sys
 import time
 
 # 3p
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
 import simplejson as json
 
 # project
@@ -29,16 +34,16 @@ from config import get_system_stats, get_version
 import checks.system.unix as u
 import checks.system.win32 as w32
 import modules
-from util import (
-    get_uuid,
-    Timer,
-)
-from utils.cloud_metadata import GCE, EC2
-from utils.logger import log_exceptions
+from util import get_uuid
+from utils.cloud_metadata import GCE, EC2, CloudFoundry, Azure
+from utils.logger import log_exceptions, RedactedLogRecord
 from utils.jmx import JMXFiles
 from utils.platform import Platform, get_os
 from utils.subprocess_output import get_subprocess_output
+from utils.timer import Timer
+from utils.orchestrator import MetadataCollector
 
+logging.LogRecord = RedactedLogRecord
 log = logging.getLogger(__name__)
 
 
@@ -190,6 +195,10 @@ class Collector(object):
         self.initialized_checks_d = []
         self.init_failed_checks_d = {}
 
+        if Platform.is_linux() and psutil is not None:
+            procfs_path = agentConfig.get('procfs_path', '/proc').rstrip('/')
+            psutil.PROCFS_PATH = procfs_path
+
         # Unix System Checks
         self._unix_system_checks = {
             'io': u.IO(log),
@@ -197,7 +206,8 @@ class Collector(object):
             'memory': u.Memory(log),
             'processes': u.Processes(log),
             'cpu': u.Cpu(log),
-            'system': u.System(log)
+            'system': u.System(log),
+            'file_handles': u.FileHandles(log)
         }
 
         # Win32 System `Checks
@@ -205,7 +215,6 @@ class Collector(object):
             'io': w32.IO(log),
             'proc': w32.Processes(log),
             'memory': w32.Memory(log),
-            'network': w32.Network(log),
             'cpu': w32.Cpu(log),
             'system': w32.System(log)
         }
@@ -283,27 +292,30 @@ class Collector(object):
         service_checks = payload['service_checks']
 
         # Run the system checks. Checks will depend on the OS
-        try:
-            if Platform.is_windows():
-                # Win32 system checks
-                    metrics.extend(self._win32_system_checks['memory'].check(self.agentConfig))
-                    metrics.extend(self._win32_system_checks['cpu'].check(self.agentConfig))
-                    metrics.extend(self._win32_system_checks['network'].check(self.agentConfig))
-                    metrics.extend(self._win32_system_checks['io'].check(self.agentConfig))
-                    metrics.extend(self._win32_system_checks['proc'].check(self.agentConfig))
-                    metrics.extend(self._win32_system_checks['system'].check(self.agentConfig))
-            else:
-                # Unix system checks
-                sys_checks = self._unix_system_checks
+        if Platform.is_windows():
+            # Win32 system checks
+            for check_name in ['memory', 'cpu', 'io', 'proc', 'system']:
+                try:
+                    metrics.extend(self._win32_system_checks[check_name].check(self.agentConfig))
+                except Exception:
+                    log.exception('Unable to get %s metrics', check_name)
+        else:
+            # Unix system checks
+            sys_checks = self._unix_system_checks
 
-                load = sys_checks['load'].check(self.agentConfig)
-                payload.update(load)
+            for check_name in ['load', 'system', 'cpu', 'file_handles']:
+                try:
+                    result_check = sys_checks[check_name].check(self.agentConfig)
+                    if result_check:
+                        payload.update(result_check)
+                except Exception:
+                    log.exception('Unable to get %s metrics', check_name)
 
-                system = sys_checks['system'].check(self.agentConfig)
-                payload.update(system)
-
+            try:
                 memory = sys_checks['memory'].check(self.agentConfig)
-
+            except Exception:
+                    log.exception('Unable to get memory metrics')
+            else:
                 if memory:
                     memstats = {
                         'memPhysUsed': memory.get('physUsed'),
@@ -324,18 +336,20 @@ class Collector(object):
                     }
                     payload.update(memstats)
 
+            try:
                 ioStats = sys_checks['io'].check(self.agentConfig)
+            except Exception:
+                    log.exception('Unable to get io metrics')
+            else:
                 if ioStats:
                     payload['ioStats'] = ioStats
 
+            try:
                 processes = sys_checks['processes'].check(self.agentConfig)
+            except Exception:
+                    log.exception('Unable to get processes metrics')
+            else:
                 payload.update({'processes': processes})
-
-                cpuStats = sys_checks['cpu'].check(self.agentConfig)
-                if cpuStats:
-                    payload.update(cpuStats)
-        except Exception:
-            log.exception('Unable to fetch some system metrics.')
 
         # Run old-style checks
         if self._ganglia is not None:
@@ -427,7 +441,7 @@ class Collector(object):
                 event_count, service_check_count, service_metadata=current_check_metadata,
                 library_versions=check.get_library_info(),
                 source_type_name=check.SOURCE_TYPE_NAME or check.name,
-                check_stats=check_stats
+                check_stats=check_stats, check_version=check.check_version
             )
 
             # Service check for Agent checks failures
@@ -462,6 +476,7 @@ class Collector(object):
             if not self.continue_running:
                 return
             check_status = CheckStatus(check_name, None, None, None, None,
+                                       check_version=info.get('version', 'unknown'),
                                        init_failed_error=info['error'],
                                        init_failed_traceback=info['traceback'])
             check_statuses.append(check_status)
@@ -503,6 +518,20 @@ class Collector(object):
         emitter_statuses = payload.emit(log, self.agentConfig, self.emitters,
                                         self.continue_running)
         self.emit_duration = timer.step()
+
+        if self._is_first_run():
+            # This is not the exact payload sent to the backend as minor post
+            # processing is done, but this will give us a good idea of what is sent
+            # to the backend.
+            data = payload.payload # deep copy and merge of meta and metric data
+            data['apiKey'] = '*************************' + data.get('apiKey', '')[-5:]
+            # removing unused keys for the metadata payload
+            del data['metrics']
+            del data['events']
+            del data['service_checks']
+            if data.get('processes'):
+                data['processes']['apiKey'] = '*************************' + data['processes'].get('apiKey', '')[-5:]
+            log.debug("Metadata payload: %s", json.dumps(data))
 
         # Persist the status of the collection run.
         try:
@@ -635,6 +664,12 @@ class Collector(object):
             payload['systemStats'] = get_system_stats(
                 proc_path=self.agentConfig.get('procfs_path', '/proc').rstrip('/')
             )
+
+            if self.agentConfig['collect_orchestrator_tags']:
+                host_container_metadata = MetadataCollector().get_host_metadata()
+                if host_container_metadata:
+                    payload['container-meta'] = host_container_metadata
+
             payload['meta'] = self._get_hostname_metadata()
 
             self.hostname_metadata_cache = payload['meta']
@@ -646,6 +681,11 @@ class Collector(object):
 
             if self.agentConfig['collect_ec2_tags']:
                 host_tags.extend(EC2.get_tags(self.agentConfig))
+
+            if self.agentConfig['collect_orchestrator_tags']:
+                host_docker_tags = MetadataCollector().get_host_tags()
+                if host_docker_tags:
+                    host_tags.extend(host_docker_tags)
 
             if host_tags:
                 payload['host-tags']['system'] = host_tags
@@ -731,6 +771,7 @@ class Collector(object):
                 metadata["socket-hostname"] = socket.gethostname()
             except Exception:
                 pass
+
         try:
             metadata["socket-fqdn"] = socket.getfqdn()
         except Exception:
@@ -740,9 +781,22 @@ class Collector(object):
         metadata["timezones"] = self._decode_tzname(time.tzname)
 
         # Add cloud provider aliases
+        if not metadata.get("host_aliases"):
+            metadata["host_aliases"] = []
+
         host_aliases = GCE.get_host_aliases(self.agentConfig)
         if host_aliases:
-            metadata['host_aliases'] = host_aliases
+            metadata['host_aliases'] += host_aliases
+
+        # Try to get Azure VM ID
+        host_aliases = Azure.get_host_aliases(self.agentConfig)
+        if host_aliases:
+            metadata['host_aliases'] += host_aliases
+
+        try:
+            metadata["host_aliases"] += CloudFoundry.get_host_aliases(self.agentConfig)
+        except Exception:
+            pass
 
         return metadata
 
@@ -765,15 +819,14 @@ class Collector(object):
         return self._run_gohai(['--only', 'processes'])
 
     def _run_gohai(self, options):
+        # Gohai is disabled on Mac for now
+        if Platform.is_mac() or not self.agentConfig.get('enable_gohai'):
+            return None
         output = None
         try:
-            if not Platform.is_windows():
-                command = "gohai"
-            else:
-                command = "gohai\gohai.exe"
-            output, err, _ = get_subprocess_output([command] + options, log)
+            output, err, _ = get_subprocess_output(["gohai"] + options, log)
             if err:
-                log.warning("GOHAI LOG | {0}".format(err))
+                log.debug("GOHAI LOG | %s", err)
         except OSError as e:
             if e.errno == 2:  # file not found, expected when install from source
                 log.info("gohai file not found")

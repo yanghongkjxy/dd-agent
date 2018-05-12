@@ -16,7 +16,6 @@ from checks import (
 from checks.collector import Collector
 from tests.checks.common import load_check
 from utils.hostname import get_hostname
-from utils.ntp import NTPUtil
 from utils.proxy import get_proxy
 
 logger = logging.getLogger()
@@ -107,6 +106,7 @@ class TestCore(unittest.TestCase):
         self.assertEquals(self.c.normalize("__metric__", "prefix"), "prefix.metric")
         self.assertEquals(self.c.normalize("abc.metric(a+b+c{}/5)", "prefix"), "prefix.abc.metric_a_b_c_5")
         self.assertEquals(self.c.normalize("VBE.default(127.0.0.1,,8080).happy", "varnish"), "varnish.VBE.default_127.0.0.1_8080.happy")
+        self.assertEquals(self.c.normalize("metric@device"), "metric_device")
 
         # Same tests for the AgentCheck
         self.setUpAgentCheck()
@@ -115,9 +115,11 @@ class TestCore(unittest.TestCase):
         self.assertEquals(self.ac.normalize("__metric__", "prefix"), "prefix.metric")
         self.assertEquals(self.ac.normalize("abc.metric(a+b+c{}/5)", "prefix"), "prefix.abc.metric_a_b_c_5")
         self.assertEquals(self.ac.normalize("VBE.default(127.0.0.1,,8080).happy", "varnish"), "varnish.VBE.default_127.0.0.1_8080.happy")
+        self.assertEquals(self.ac.normalize("metric@device"), "metric_device")
 
         self.assertEqual(self.ac.normalize("PauseTotalNs", "prefix", fix_case = True), "prefix.pause_total_ns")
         self.assertEqual(self.ac.normalize("Metric.wordThatShouldBeSeparated", "prefix", fix_case = True), "prefix.metric.word_that_should_be_separated")
+        self.assertEqual(self.ac.normalize_device_name(",@+*-()[]{}//device@name"), "___________//device_name")
 
     def test_service_check(self):
         check_name = 'test.service_check'
@@ -127,7 +129,24 @@ class TestCore(unittest.TestCase):
         timestamp = time.time()
 
         check = AgentCheck('test', {}, {'checksd_hostname':'foo'})
-        check.service_check(check_name, status, tags, timestamp, host_name)
+        # No "message"/"tags" field
+        check.service_check(check_name, status, timestamp=timestamp, hostname=host_name)
+        self.assertEquals(len(check.service_checks), 1, check.service_checks)
+        val = check.get_service_checks()
+        self.assertEquals(len(val), 1)
+        check_run_id = val[0].get('id', None)
+        self.assertNotEquals(check_run_id, None)
+        self.assertEquals([{
+            'id': check_run_id,
+            'check': check_name,
+            'status': status,
+            'host_name': host_name,
+            'timestamp': timestamp,
+        }], val)
+        self.assertEquals(len(check.service_checks), 0, check.service_checks)
+
+        # With "message" field
+        check.service_check(check_name, status, tags, timestamp, host_name, message='foomessage')
         self.assertEquals(len(check.service_checks), 1, check.service_checks)
         val = check.get_service_checks()
         self.assertEquals(len(val), 1)
@@ -140,73 +159,10 @@ class TestCore(unittest.TestCase):
             'host_name': host_name,
             'tags': tags,
             'timestamp': timestamp,
-            'message': None,
+            'message': 'foomessage',
         }], val)
         self.assertEquals(len(check.service_checks), 0, check.service_checks)
 
-    def test_collector(self):
-        agentConfig = {
-            'api_key': 'test_apikey',
-            'check_timings': True,
-            'collect_ec2_tags': True,
-            'collect_instance_metadata': False,
-            'create_dd_check_tags': False,
-            'version': 'test',
-            'tags': '',
-        }
-
-        # Run a single checks.d check as part of the collector.
-        redis_config = {
-            "init_config": {},
-            "instances": [{"host": "localhost", "port": 6379}]
-        }
-        checks = [load_check('redisdb', redis_config, agentConfig)]
-
-        c = Collector(agentConfig, [], {}, get_hostname(agentConfig))
-        payload = c.run({
-            'initialized_checks': checks,
-            'init_failed_checks': {}
-        })
-        metrics = payload['metrics']
-
-        # Check that we got a timing metric for all checks.
-        timing_metrics = [m for m in metrics
-            if m[0] == 'datadog.agent.check_run_time']
-        all_tags = []
-        for metric in timing_metrics:
-            all_tags.extend(metric[3]['tags'])
-        for check in checks:
-            tag = "check:%s" % check.name
-            assert tag in all_tags, all_tags
-
-    def test_apptags(self):
-        '''
-        Tests that the app tags are sent if specified so
-        '''
-        agentConfig = {
-            'api_key': 'test_apikey',
-            'collect_ec2_tags': False,
-            'collect_instance_metadata': False,
-            'create_dd_check_tags': True,
-            'version': 'test',
-            'tags': '',
-        }
-
-        # Run a single checks.d check as part of the collector.
-        redis_config = {
-            "init_config": {},
-            "instances": [{"host": "localhost", "port": 6379}]
-        }
-        checks = [load_check('redisdb', redis_config, agentConfig)]
-
-        c = Collector(agentConfig, [], {}, get_hostname(agentConfig))
-        payload = c.run({
-            'initialized_checks': checks,
-            'init_failed_checks': {}
-        })
-
-        # We check that the redis DD_CHECK_TAG is sent in the payload
-        self.assertTrue('dd_check:redisdb' in payload['host-tags']['system'])
 
     def test_no_proxy(self):
         """ Starting with Agent 5.0.0, there should always be a local forwarder
@@ -274,6 +230,9 @@ class TestCore(unittest.TestCase):
                 "password": "barenv"
             })
 
+
+class TestCollectionInterval(unittest.TestCase):
+
     def test_min_collection_interval(self):
         config = {'instances': [{}], 'init_config': {}}
 
@@ -340,59 +299,73 @@ class TestCore(unittest.TestCase):
         metrics = check.get_metrics()
         self.assertTrue(len(metrics) > 0, metrics)
 
-    def test_ntp_global_settings(self):
-        # Clear any existing ntp config
-        NTPUtil._drop()
-
-        config = {'instances': [{
-            "host": "foo.com",
-            "port": "bar",
-            "version": 42,
-            "timeout": 13.37}],
-            'init_config': {}}
-
+    def test_collector(self):
         agentConfig = {
-            'version': '0.1',
-            'api_key': 'toto'
+            'api_key': 'test_apikey',
+            'check_timings': True,
+            'collect_ec2_tags': True,
+            'collect_orchestrator_tags': False,
+            'collect_instance_metadata': False,
+            'create_dd_check_tags': False,
+            'version': 'test',
+            'tags': '',
         }
 
-        # load this config in the ntp singleton
-        ntp_util = NTPUtil(config)
-
-        # default min collection interval for that check was 20sec
-        check = load_check('ntp', config, agentConfig)
-        check.run()
-
-        self.assertEqual(ntp_util.args["host"], "foo.com")
-        self.assertEqual(ntp_util.args["port"], "bar")
-        self.assertEqual(ntp_util.args["version"], 42)
-        self.assertEqual(ntp_util.args["timeout"], 13.37)
-
-        # Clear the singleton to prepare for next config
-        NTPUtil._drop()
-
-        config = {'instances': [{}], 'init_config': {}}
-        agentConfig = {
-            'version': '0.1',
-            'api_key': 'toto'
+        # Run a single checks.d check as part of the collector.
+        disk_config = {
+            "init_config": {},
+            "instances": [{}]
         }
 
-        # load the new config
-        ntp_util = NTPUtil(config)
+        checks = [load_check('disk', disk_config, agentConfig)]
 
-        # default min collection interval for that check was 20sec
-        check = load_check('ntp', config, agentConfig)
-        try:
-            check.run()
-        except Exception:
-            pass
+        c = Collector(agentConfig, [], {}, get_hostname(agentConfig))
+        payload = c.run({
+            'initialized_checks': checks,
+            'init_failed_checks': {}
+        })
+        metrics = payload['metrics']
 
-        self.assertTrue(ntp_util.args["host"].endswith("datadog.pool.ntp.org"))
-        self.assertEqual(ntp_util.args["port"], "ntp")
-        self.assertEqual(ntp_util.args["version"], 3)
-        self.assertEqual(ntp_util.args["timeout"], 1.0)
+        # Check that we got a timing metric for all checks.
+        timing_metrics = [m for m in metrics
+            if m[0] == 'datadog.agent.check_run_time']
+        all_tags = []
+        for metric in timing_metrics:
+            all_tags.extend(metric[3]['tags'])
+        for check in checks:
+            tag = "check:%s" % check.name
+            assert tag in all_tags, all_tags
 
-        NTPUtil._drop()
+    def test_apptags(self):
+        '''
+        Tests that the app tags are sent if specified so
+        '''
+        agentConfig = {
+            'api_key': 'test_apikey',
+            'collect_ec2_tags': False,
+            'collect_orchestrator_tags': False,
+            'collect_instance_metadata': False,
+            'create_dd_check_tags': True,
+            'version': 'test',
+            'tags': '',
+        }
+
+        # Run a single checks.d check as part of the collector.
+        disk_config = {
+            "init_config": {},
+            "instances": [{}]
+        }
+
+        checks = [load_check('disk', disk_config, agentConfig)]
+
+        c = Collector(agentConfig, [], {}, get_hostname(agentConfig))
+        payload = c.run({
+            'initialized_checks': checks,
+            'init_failed_checks': {}
+        })
+
+        # We check that the redis DD_CHECK_TAG is sent in the payload
+        self.assertTrue('dd_check:disk' in payload['host-tags']['system'])
 
 
 class TestAggregator(unittest.TestCase):

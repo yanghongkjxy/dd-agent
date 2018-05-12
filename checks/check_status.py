@@ -24,13 +24,17 @@ import yaml
 
 # project
 import config
-from config import _is_affirmative, _windows_commondata_path, get_config
+from config import (_is_affirmative,
+                    _windows_commondata_path,
+                    get_config,
+                    AGENT_VERSION)
 from util import plural
 from utils.jmx import JMXFiles
 from utils.ntp import NTPUtil
 from utils.pidfile import PidFile
 from utils.platform import Platform
 from utils.profile import pretty_statistics
+from utils.proxy import get_proxy
 
 
 STATUS_OK = 'OK'
@@ -116,19 +120,26 @@ def get_ntp_info():
         ntp_styles = []
     return ntp_offset, ntp_styles
 
-def validate_api_key(api_key):
+def validate_api_key(config):
     try:
-        r = requests.get("https://app.datadoghq.com/api/v1/validate",
-            params={'api_key': api_key}, timeout=3)
+        proxy = get_proxy(agentConfig=config)
+        request_proxy = {}
+        if proxy:
+            request_proxy = {'https': "http://{user}:{password}@{host}:{port}".format(**proxy)}
+        r = requests.get("%s/api/v1/validate" % config['dd_url'].rstrip('/'),
+            params={'api_key': config.get('api_key')}, proxies=request_proxy,
+            timeout=3, verify=(not config.get('skip_ssl_validation', False)))
 
         if r.status_code == 403:
-            return "API Key is invalid"
+            return "[ERROR] API Key is invalid"
 
         r.raise_for_status()
 
+    except requests.RequestException:
+        return "[ERROR] Unable to validate API Key. Please try again later"
     except Exception:
         log.exception("Unable to validate API Key")
-        return "Unable to validate API Key. Please try again later"
+        return "[ERROR] Unable to validate API Key (unexpected error). Please try again later"
 
     return "API Key is valid"
 
@@ -162,16 +173,16 @@ class AgentStatus(object):
         td = datetime.datetime.now() - self.created_at
         return td.seconds
 
-    def render(self):
+    def render(self, title=None):
         indent = "  "
-        lines = self._header_lines(indent) + [
+        lines = self._header_lines(indent, title) + [
             indent + l for l in self.body_lines()
         ] + ["", ""]
         return "\n".join(lines)
 
     @classmethod
-    def _title_lines(self):
-        name_line = "%s (v %s)" % (self.NAME, config.get_version())
+    def _title_lines(self, title=None):
+        name_line = title if title else "%s (v %s)" % (self.NAME, config.get_version())
         lines = [
             "=" * len(name_line),
             "%s" % name_line,
@@ -180,9 +191,9 @@ class AgentStatus(object):
         ]
         return lines
 
-    def _header_lines(self, indent):
+    def _header_lines(self, indent, title=None):
         # Don't indent the header
-        lines = self._title_lines()
+        lines = self._title_lines(title)
         if self.created_seconds_ago() > 120:
             styles = ['red', 'bold']
         else:
@@ -317,7 +328,7 @@ class CheckStatus(object):
                  event_count=None, service_check_count=None, service_metadata=[],
                  init_failed_error=None, init_failed_traceback=None,
                  library_versions=None, source_type_name=None,
-                 check_stats=None):
+                 check_stats=None, check_version=AGENT_VERSION):
         self.name = check_name
         self.source_type_name = source_type_name
         self.instance_statuses = instance_statuses
@@ -329,6 +340,7 @@ class CheckStatus(object):
         self.library_versions = library_versions
         self.check_stats = check_stats
         self.service_metadata = service_metadata
+        self.check_version = check_version
 
     @property
     def status(self):
@@ -385,8 +397,8 @@ class CollectorStatus(AgentStatus):
     @staticmethod
     def check_status_lines(cs):
         check_lines = [
-            '  ' + cs.name,
-            '  ' + '-' * len(cs.name)
+            '  ' + cs.name + ' ({})'.format(cs.check_version),
+            '  ' + '-' * (len(cs.name) + 3 + len(cs.check_version))
         ]
         if cs.init_failed_error:
             check_lines.append("    - initialize check class [%s]: %s" %
@@ -530,8 +542,8 @@ class CollectorStatus(AgentStatus):
         else:
             for cs in check_statuses:
                 check_lines = [
-                    '  ' + cs.name,
-                    '  ' + '-' * len(cs.name)
+                    '  ' + cs.name + ' ({})'.format(cs.check_version),
+                    '  ' + '-' * (len(cs.name) + 3 + len(cs.check_version))
                 ]
                 if cs.init_failed_error:
                     check_lines.append("    - initialize check class [%s]: %s" %
@@ -673,12 +685,12 @@ class CollectorStatus(AgentStatus):
         check_statuses = self.check_statuses + get_jmx_status()
         for cs in check_statuses:
             status_info['checks'][cs.name] = {'instances': {}}
+            status_info['checks'][cs.name]['check_version'] = cs.check_version
             if cs.init_failed_error:
                 status_info['checks'][cs.name]['init_failed'] = True
                 status_info['checks'][cs.name]['traceback'] = \
                     cs.init_failed_traceback or cs.init_failed_error
             else:
-                status_info['checks'][cs.name] = {'instances': {}}
                 status_info['checks'][cs.name]['init_failed'] = False
                 for s in cs.instance_statuses:
                     status_info['checks'][cs.name]['instances'][s.instance_id] = {
@@ -773,6 +785,17 @@ class DogstatsdStatus(AgentStatus):
         })
         return status_info
 
+    @classmethod
+    def _dogstatsd6_unavailable_message(cls, title=None):
+        lines = cls._title_lines(title) + [
+            style("  %s6 [BETA] unable to collect statistics." % cls.NAME, 'red'),
+            style("  Problem with expvar endpoint or process.", 'red'),
+            style("  Please consult dogstatsd6 logs.", 'red'),
+            "",
+            ""
+        ]
+        return "\n".join(lines)
+
 
 class ForwarderStatus(AgentStatus):
 
@@ -798,7 +821,7 @@ class ForwarderStatus(AgentStatus):
             "Transactions received: %s" % self.transactions_received,
             "Transactions flushed: %s" % self.transactions_flushed,
             "Transactions rejected: %s" % self.transactions_rejected,
-            "API Key Status: %s" % validate_api_key(get_config().get('api_key')),
+            "API Key Status: %s" % validate_api_key(config=get_config()),
             "",
         ]
 
